@@ -35,6 +35,10 @@ class GlancesStats:
         # Set the argument instance
         self.args = args
 
+        # Observers notified after a plugin update completes
+        # (e.g. the WebSocket push manager, see outputs/glances_websocket.py)
+        self._update_observers = []
+
         # Load plugins and exports modules
         self.first_export = True
         self.load_modules(self.args)
@@ -319,6 +323,30 @@ please rename it to "{plugin_path.capitalize()}Plugin"'
         self._plugins[p].update()
         self._plugins[p].update_views()
         self._plugins[p].update_stats_history()
+        # Notify observers that fresh stats are available for this plugin
+        self._notify_plugin_updated(p)
+
+    def register_update_observer(self, callback):
+        """Register a callback invoked with the plugin name after each plugin update.
+
+        The callback signature is callback(plugin_name). It is called from the
+        thread performing the stats update, so it must be fast and non-blocking.
+        """
+        if callback not in self._update_observers:
+            self._update_observers.append(callback)
+
+    def unregister_update_observer(self, callback):
+        """Remove a callback previously registered with register_update_observer."""
+        if callback in self._update_observers:
+            self._update_observers.remove(callback)
+
+    def _notify_plugin_updated(self, plugin_name):
+        """Invoke all registered observers for the given plugin name."""
+        for callback in list(self._update_observers):
+            try:
+                callback(plugin_name)
+            except Exception as e:
+                logger.error(f'Error in stats update observer {callback}: {e}')
 
     def update(self, plugins_list_to_update=None):
         """Wrapper method to update stats.

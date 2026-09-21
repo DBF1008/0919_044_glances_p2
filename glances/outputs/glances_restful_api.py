@@ -39,6 +39,7 @@ except ImportError:
     MCP_AVAILABLE = False
     GlancesMcpServer = None
 
+from glances.outputs.glances_websocket import GlancesWebSocketManager
 from glances.plugins.plugin.dag import get_plugin_dependencies
 from glances.processes import glances_processes
 from glances.servers_list import GlancesServersList
@@ -49,6 +50,7 @@ from glances.timer import Timer
 # FastAPI import
 try:
     from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
+    from fastapi import WebSocket
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.middleware.gzip import GZipMiddleware
     from fastapi.responses import HTMLResponse, JSONResponse
@@ -363,6 +365,27 @@ class GlancesRestfulApi:
             logger.warning("MCP server is enabled in config but the 'mcp' package is not installed.")
             logger.warning("Install it with: pip install 'glances[mcp]'")
 
+        # WebSocket stats push endpoint (/ws/stats).
+        # Clients subscribe to a comma-separated plugin list or '*' and receive
+        # incremental stats pushed at each plugin refresh rate (with ACK-based
+        # backpressure). The endpoint shares the FastAPI/uvicorn stack and does
+        # not conflict with the /api/ routes or the MCP SSE endpoint.
+        self._ws_manager = GlancesWebSocketManager(
+            args=self.args,
+            config=self.config,
+            max_connections=self.websocket_max_connections,
+            idle_timeout=self.websocket_idle_timeout,
+        )
+        if self.websocket_enabled:
+            self._app.add_api_websocket_route(self.url_prefix + '/ws/stats', self._websocket_stats)
+            ws_protocol = 'wss' if self.is_ssl() else 'ws'
+            ws_bind_url = urljoin(
+                f'{ws_protocol}://{self.args.bind_address}:{self.args.port}/', self.url_prefix.lstrip('/')
+            )
+            bindmsg = f'Glances WebSocket stats push started on {ws_bind_url.rstrip("/")}/ws/stats'
+            logger.info(bindmsg)
+            print(bindmsg)
+
         # Enable auto discovering of the service
         self.autodiscover_client = None
         if not self.args.disable_autodiscover:
@@ -383,6 +406,9 @@ class GlancesRestfulApi:
         self.webui_allowed_hosts = None
         self.mcp_enabled = False
         self.mcp_path = '/mcp'
+        self.websocket_enabled = True
+        self.websocket_max_connections = 16
+        self.websocket_idle_timeout = 300
         if config is not None and config.has_section('outputs'):
             # Max process to display in the WebUI
             n = config.get_value('outputs', 'max_processes_display', default=None)
@@ -404,11 +430,22 @@ class GlancesRestfulApi:
             self.mcp_path = config.get_value('outputs', 'mcp_path', default='/mcp')
             if not self.mcp_path.startswith('/'):
                 self.mcp_path = '/' + self.mcp_path
+            # WebSocket stats push endpoint (/ws/stats)
+            self.websocket_enabled = config.get_bool_value('outputs', 'enable_websocket', default=True)
+            self.websocket_max_connections = config.get_int_value(
+                'outputs', 'websocket_max_connections', default=16
+            )
+            self.websocket_idle_timeout = config.get_int_value('outputs', 'websocket_idle_timeout', default=300)
 
         logger.debug(f"Protocol for Resful API and WebUI: {self.protocol}")
         logger.debug(
             f"MCP server enabled: {self.mcp_enabled} \
             (path: {self.url_prefix + self.mcp_path})"
+        )
+        logger.debug(
+            f"WebSocket stats push enabled: {self.websocket_enabled} \
+            (path: {self.url_prefix}/ws/stats, max connections: {self.websocket_max_connections}, \
+            idle timeout: {self.websocket_idle_timeout}s)"
         )
 
     def is_ssl(self):
@@ -476,6 +513,58 @@ class GlancesRestfulApi:
             "Incorrect authentication",
             {"WWW-Authenticate": "Basic"},
         )
+
+    @property
+    def websocket_observer(self):
+        """Return the stats update observer callback of the WebSocket manager.
+
+        To be registered with GlancesStats.register_update_observer so that
+        plugin updates are pushed to the subscribed WebSocket clients.
+        """
+        return self._ws_manager.notify_plugin_updated
+
+    def _is_websocket_authenticated(self, websocket: WebSocket) -> bool:
+        """Check Basic or Bearer (JWT) credentials of a WebSocket handshake.
+
+        Mirrors the REST API authentication: if no password is configured,
+        the endpoint is open.
+        """
+        if not self.args.password:
+            return True
+
+        import base64
+
+        auth = websocket.headers.get('authorization', '')
+
+        # JWT Bearer token
+        if self._jwt_handler is not None and auth.lower().startswith('bearer '):
+            token = auth.split(' ', 1)[1]
+            username = self._jwt_handler.verify_token(token)
+            return username is not None and username == self.args.username
+
+        # HTTP Basic Auth
+        if auth.lower().startswith('basic '):
+            try:
+                decoded = base64.b64decode(auth[6:]).decode('utf-8')
+                username, _, password = decoded.partition(':')
+                return username == self.args.username and self._password.check_password(
+                    self.args.password, self._password.get_hash(password)
+                )
+            except Exception:
+                return False
+
+        return False
+
+    async def _websocket_stats(self, websocket: WebSocket, plugins: str = '*'):
+        """WebSocket endpoint pushing plugin stats updates to subscribed clients.
+
+        Query parameter:
+        - plugins: comma-separated list of plugin names or '*' (all, default)
+        """
+        if not self._is_websocket_authenticated(websocket):
+            await websocket.close(code=4401, reason='Not authenticated')
+            return
+        await self._ws_manager.handle_connection(websocket, plugins)
 
     def _logo(self):
         return rf"""
@@ -654,6 +743,9 @@ class GlancesRestfulApi:
         if self._mcp_server is not None:
             self._mcp_server.set_stats(self.stats)
 
+        # Propagate stats to the WebSocket push manager
+        self._ws_manager.set_stats(self.stats)
+
         # Init plugin list
         self.plugins_list = self.stats.getPluginsList()
 
@@ -689,6 +781,11 @@ class GlancesRestfulApi:
 
     def end(self):
         """End the Web server"""
+        # Stop the WebSocket push manager (scheduler + open connections) and
+        # detach it from the stats update observers
+        if self.stats is not None:
+            self.stats.unregister_update_observer(self._ws_manager.notify_plugin_updated)
+        self._ws_manager.stop()
         if not self.args.disable_autodiscover and self.autodiscover_client:
             self.autodiscover_client.close()
         logger.info("Close the Web server")

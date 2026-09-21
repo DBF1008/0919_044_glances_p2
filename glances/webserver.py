@@ -6,7 +6,7 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 #
 
-"""Glances Restful/API and Web based interface."""
+"""Glances Restful/API, WebSocket push and Web based interface."""
 
 from glances.globals import WINDOWS
 from glances.outputs.glances_restful_api import GlancesRestfulApi
@@ -34,11 +34,17 @@ class GlancesWebServer:
         # Init the Web server
         self.web = GlancesRestfulApi(config=config, args=args)
 
+        # Wire the WebSocket push notifications: when a plugin update
+        # completes, GlancesStats notifies the WebSocket manager which
+        # broadcasts the fresh stats to the subscribed clients
+        self.stats.register_update_observer(self.web.websocket_observer)
+
     def serve_forever(self):
         """Main loop for the Web server."""
         self.web.start(self.stats)
 
     def end(self):
         """End of the Web server."""
+        self.stats.unregister_update_observer(self.web.websocket_observer)
         self.web.end()
         self.stats.end()

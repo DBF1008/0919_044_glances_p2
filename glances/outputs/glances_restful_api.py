@@ -38,6 +38,14 @@ try:
 except ImportError:
     MCP_AVAILABLE = False
     GlancesMcpServer = None
+# WebSocket import with fallback
+try:
+    from glances.outputs.glances_websocket import GlancesWebSocketManager
+
+    WS_AVAILABLE = True
+except ImportError:
+    WS_AVAILABLE = False
+    GlancesWebSocketManager = None
 
 from glances.plugins.plugin.dag import get_plugin_dependencies
 from glances.processes import glances_processes
@@ -383,6 +391,11 @@ class GlancesRestfulApi:
         self.webui_allowed_hosts = None
         self.mcp_enabled = False
         self.mcp_path = '/mcp'
+        # WebSocket (/ws/stats) options
+        self.ws_enabled = True
+        self.ws_max_connections = 100
+        self.ws_idle_timeout = 60
+        self.ws_update_interval = 1
         if config is not None and config.has_section('outputs'):
             # Max process to display in the WebUI
             n = config.get_value('outputs', 'max_processes_display', default=None)
@@ -404,11 +417,24 @@ class GlancesRestfulApi:
             self.mcp_path = config.get_value('outputs', 'mcp_path', default='/mcp')
             if not self.mcp_path.startswith('/'):
                 self.mcp_path = '/' + self.mcp_path
+            # WebSocket (/ws/stats) options
+            self.ws_enabled = config.get_bool_value('outputs', 'enable_websocket', default=True)
+            self.ws_max_connections = config.get_int_value(
+                'outputs', 'websocket_max_connections', default=100
+            )
+            self.ws_idle_timeout = config.get_int_value('outputs', 'websocket_idle_timeout', default=60)
+            self.ws_update_interval = config.get_int_value(
+                'outputs', 'websocket_update_interval', default=1
+            )
 
         logger.debug(f"Protocol for Resful API and WebUI: {self.protocol}")
         logger.debug(
             f"MCP server enabled: {self.mcp_enabled} \
             (path: {self.url_prefix + self.mcp_path})"
+        )
+        logger.debug(
+            f"WebSocket stats endpoint enabled: {self.ws_enabled} "
+            f"(path: {self.url_prefix}/ws/stats)"
         )
 
     def is_ssl(self):

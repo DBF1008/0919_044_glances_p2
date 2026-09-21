@@ -39,6 +39,49 @@ class GlancesStats:
         self.first_export = True
         self.load_modules(self.args)
 
+        # Observers notified (plugin_name, plugin_instance) right after a
+        # plugin has been updated. Used by the WebSocket server to push stats
+        # without polling this object.
+        self._observers = []
+        self._observers_lock = threading.Lock()
+
+        # Background update loop (started by the Web server when a generic
+        # realtime push is needed).
+        self._update_loop_thread = None
+        self._update_loop_stop = threading.Event()
+
+    def add_observer(self, callback):
+        """Register a callback called after each plugin update.
+
+        The callback is invoked synchronously from the update thread with two
+        arguments: the plugin name and the plugin instance. Callbacks must be
+        fast and non-blocking (they should hand work over to another thread or
+        to an event loop).
+        """
+        with self._observers_lock:
+            if callback not in self._observers:
+                self._observers.append(callback)
+
+    def remove_observer(self, callback):
+        """Unregister a previously added observer callback."""
+        with self._observers_lock:
+            try:
+                self._observers.remove(callback)
+            except ValueError:
+                pass
+
+    def _notify_observers(self, plugin_name, plugin):
+        """Notify all the registered observers that a plugin was updated."""
+        with self._observers_lock:
+            observers = list(self._observers)
+        for callback in observers:
+            try:
+                callback(plugin_name, plugin)
+            except Exception as e:
+                # A failing observer must never break the stats update loop
+                logger.error(f"Error in observer callback for plugin {plugin_name}: {e}")
+                logger.debug(traceback.format_exc())
+
     def __getattr__(self, item):
         """Overwrite the getattr method in case of attribute is not found.
 
@@ -316,9 +359,19 @@ please rename it to "{plugin_path.capitalize()}Plugin"'
     @weak_lru_cache(ttl=1)
     def update_plugin(self, p):
         """Update stats, history and views for the given plugin name p"""
+        plugin = self._plugins[p]
+        # Detect if the plugin really performs an update: the plugin update
+        # decorator skips the actual refresh while its refresh_timer is running.
+        refresh_timer_before = plugin.refresh_timer
+        was_init_value = plugin.stats == plugin.get_init_value()
+        will_refresh = refresh_timer_before.finished() or was_init_value
         self._plugins[p].update()
         self._plugins[p].update_views()
         self._plugins[p].update_stats_history()
+        if will_refresh:
+            # The plugin followed its own refresh interval and produced fresh
+            # data, notify the observers (e.g. the WebSocket broadcaster).
+            self._notify_observers(p, plugin)
 
     def update(self, plugins_list_to_update=None):
         """Wrapper method to update stats.
@@ -330,6 +383,40 @@ please rename it to "{plugin_path.capitalize()}Plugin"'
         # Start update of all enable plugins
         for p in plugins_list_to_update:
             self.update_plugin(p)
+
+    def start_update_loop(self, interval=1):
+        """Start a background thread updating all the enabled plugins.
+
+        Each plugin still manages its own refresh interval internally, so the
+        loop can run at a short fixed interval. The loop drives the observer
+        notifications used by the WebSocket broadcaster.
+        """
+        interval = float(interval) if interval else 1.0
+        if self._update_loop_thread is not None and self._update_loop_thread.is_alive():
+            return
+        self._update_loop_stop.clear()
+
+        def _run():
+            logger.debug(f"Stats background update loop started (interval: {interval} seconds)")
+            while not self._update_loop_stop.is_set():
+                try:
+                    self.update()
+                except Exception as e:
+                    logger.error(f"Error in stats background update loop: {e}")
+                    logger.debug(traceback.format_exc())
+                self._update_loop_stop.wait(interval)
+            logger.debug("Stats background update loop stopped")
+
+        self._update_loop_thread = threading.Thread(target=_run, name="glances-stats-update", daemon=True)
+        self._update_loop_thread.start()
+
+    def stop_update_loop(self, timeout=5):
+        """Stop the background update loop started by start_update_loop."""
+        self._update_loop_stop.set()
+        thread = self._update_loop_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+        self._update_loop_thread = None
 
     def export(self, input_stats=None):
         """Export all the stats.
@@ -460,6 +547,8 @@ please rename it to "{plugin_path.capitalize()}Plugin"'
 
     def end(self):
         """End of the Glances stats."""
+        # Stop the background update loop
+        self.stop_update_loop()
         # Close export modules
         for e in self._exports:
             self._exports[e].exit()
